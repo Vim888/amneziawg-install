@@ -7,8 +7,214 @@ RED='\033[0;31m'
 ORANGE='\033[0;33m'
 GREEN='\033[0;32m'
 NC='\033[0m'
+# Derived during NEW setup from the last two octets of the public IPv4.
+WGIP=""
+SCRIPT_VERSION="1.2-debian13"
 
 AMNEZIAWG_DIR="/etc/amnezia/amneziawg"
+
+function fail() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+function setupError() {
+    local status="$1" line="$2"
+    trap - ERR
+    echo "Installation stopped at line ${line} (exit ${status})." >&2
+    echo "Kernel: $(uname -r). Review the error above; setup was not marked successful." >&2
+    if command -v dkms >/dev/null 2>&1; then
+        dkms status >&2 || true
+        echo "DKMS build logs: /var/lib/dkms/amneziawg/*/*/*/log/make.log or /var/lib/dkms/amneziawg/*/build/make.log" >&2
+    fi
+    exit "$status"
+}
+
+function validIPv4() {
+    local address="$1" octet
+    local -a octets
+    [[ "$address" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r -a octets <<< "$address"
+    for octet in "${octets[@]}"; do
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+function publicIPv4() {
+    validIPv4 "$1" || return 1
+    local a b c d
+    IFS=. read -r a b c d <<< "$1"
+    a=$((10#$a)); b=$((10#$b))
+    # Reject local/private, shared NAT, loopback, link-local and multicast.
+    (( a > 0 && a < 224 && a != 10 && a != 127 )) || return 1
+    (( a != 172 || b < 16 || b > 31 )) || return 1
+    (( a != 192 || b != 168 )) || return 1
+    (( a != 169 || b != 254 )) || return 1
+    (( a != 100 || b < 64 || b > 127 )) || return 1
+    (( a != 198 || (b != 18 && b != 19) )) || return 1
+}
+
+function detectPublicIPv4() {
+    local address url
+    # Select the default route's source, not the first address of a VPN/LAN.
+    address=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src") {print $(i+1); exit}}')
+    if publicIPv4 "$address"; then
+        printf '%s\n' "$address"
+        return 0
+    fi
+    # A server behind NAT needs its external address. Never use a proxy here.
+    for url in https://api.ipify.org https://ipv4.icanhazip.com; do
+        address=$(curl -4 -fsS --noproxy '*' --connect-timeout 3 --max-time 8 "$url" 2>/dev/null) || continue
+        address=${address//$'\r'/}
+        if publicIPv4 "$address"; then
+            printf '%s\n' "$address"
+            return 0
+        fi
+    done
+    return 1
+}
+
+function deriveWGIP() {
+    validIPv4 "$1" || return 1
+    local a b c d
+    IFS=. read -r a b c d <<< "$1"
+    WGIP="10.$((10#$c)).$((10#$d)).1"
+}
+
+function ipv4Number() {
+    validIPv4 "$1" || return 1
+    local a b c d
+    IFS=. read -r a b c d <<< "$1"
+    printf '%u\n' "$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))"
+}
+
+function checkNetworkConflicts() {
+    local address prefix rest route_num vpn_num mask route_list
+    [[ "$SERVER_PUB_NIC" =~ ^[a-zA-Z0-9_.-]{1,15}$ ]] || fail "Invalid public interface name."
+    [[ "$SERVER_AWG_NIC" =~ ^[a-zA-Z0-9_]{1,15}$ ]] || fail "Invalid VPN interface name."
+    ip link show dev "$SERVER_PUB_NIC" >/dev/null || fail "Public interface does not exist."
+    if ip link show dev "$SERVER_AWG_NIC" >/dev/null 2>&1; then
+        fail "Interface ${SERVER_AWG_NIC} already exists; refusing to replace it."
+    fi
+    validIPv4 "$SERVER_AWG_IPV4" || fail "Invalid VPN IPv4."
+    vpn_num=$(ipv4Number "$SERVER_AWG_IPV4")
+    (( (vpn_num & 255) > 0 && (vpn_num & 255) < 255 )) || fail "VPN address must be a host address in /24."
+    route_list=$(ip -4 route show table all) || fail "Cannot inspect IPv4 routes."
+    while read -r address rest; do
+        # Include connected routes, policy routes and host routes, but not default.
+        case "$address" in
+            local|broadcast|unicast|throw|unreachable|blackhole|prohibit)
+                read -r address rest <<< "$rest" ;;
+        esac
+        [[ "$address" == default || -z "$address" ]] && continue
+        prefix=32
+        if [[ "$address" == */* ]]; then prefix=${address#*/}; address=${address%/*}; fi
+        validIPv4 "$address" || continue
+        [[ "$prefix" =~ ^[0-9]+$ ]] || continue
+        (( prefix > 0 && prefix <= 32 )) || continue
+        # Compare the common prefix: overlapping /8, /24 and /32 all matter.
+        (( prefix > 24 )) && prefix=24
+        mask=$(( (0xFFFFFFFF << (32-prefix)) & 0xFFFFFFFF ))
+        route_num=$(ipv4Number "$address")
+        if (( (vpn_num & mask) == (route_num & mask) )); then
+            fail "VPN /24 overlaps route ${address}/${prefix}. Choose another VPN IPv4 in advanced settings. No VPN routes were changed."
+        fi
+    done <<< "$route_list"
+    local listeners
+    listeners=$(ss -H -lun "sport = :${SERVER_PORT}") || fail "Cannot inspect UDP ports."
+    [[ -z "$listeners" ]] || fail "UDP port ${SERVER_PORT} is already in use."
+}
+
+function rollbackSetup() {
+    local result="$1"
+    trap - EXIT
+    if [[ "$result" != 0 && "${SETUP_NETWORK_STARTED:-n}" == y ]]; then
+        echo "Setup failed; removing this setup's interface/rules and restoring forwarding settings." >&2
+        systemctl stop "awg-quick@${SERVER_AWG_NIC}" >/dev/null 2>&1 || true
+        if [[ "$USE_NFTABLES" == y && -f "${AMNEZIAWG_DIR}/nft.sh" ]]; then
+            bash "${AMNEZIAWG_DIR}/nft.sh" down "$SERVER_PORT" "$SERVER_PUB_NIC" "$SERVER_AWG_NIC" >/dev/null 2>&1 || true
+        fi
+        sysctl -q -w "net.ipv4.ip_forward=${SETUP_OLD_FORWARD4}" || true
+        if [[ "$USE_IPV6" == y ]]; then sysctl -q -w "net.ipv6.conf.all.forwarding=${SETUP_OLD_FORWARD6}" || true; fi
+        if [[ -f "${AMNEZIAWG_DIR}/sysctl.before-setup" ]]; then
+            cp -p "${AMNEZIAWG_DIR}/sysctl.before-setup" /etc/sysctl.d/awg.conf || true
+        else
+            rm -f /etc/sysctl.d/awg.conf
+        fi
+        echo "VPN settings retained in ${AMNEZIAWG_DIR}; retry with: bash aw.sh --repair" >&2
+    fi
+    return 0
+}
+
+function enableForwarding() {
+    SETUP_OLD_FORWARD4=$(sysctl -n net.ipv4.ip_forward)
+    if [[ "$USE_IPV6" == y ]]; then SETUP_OLD_FORWARD6=$(sysctl -n net.ipv6.conf.all.forwarding); fi
+    if [[ -f /etc/sysctl.d/awg.conf ]]; then
+        cp -p /etc/sysctl.d/awg.conf "${AMNEZIAWG_DIR}/sysctl.before-setup"
+    else
+        rm -f "${AMNEZIAWG_DIR}/sysctl.before-setup"
+    fi
+    SETUP_NETWORK_STARTED=y
+    printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/awg.conf
+    if [[ "$USE_IPV6" == y ]]; then printf 'net.ipv6.conf.all.forwarding = 1\n' >> /etc/sysctl.d/awg.conf; fi
+    sysctl -p /etc/sysctl.d/awg.conf
+}
+
+function ensureKernelHeaders() {
+    local kernel header_package meta
+    kernel=$(uname -r)
+    header_package="linux-headers-${kernel}"
+    if [[ ! -f "/lib/modules/${kernel}/build/Makefile" ]]; then
+        if ! apt-get install -y "$header_package"; then
+            echo "Headers for the RUNNING kernel ${kernel} are unavailable." >&2
+            echo "Installing headers for another kernel does not fix DKMS for this kernel." >&2
+            if [[ "$OS" == debian ]]; then
+                case "$kernel" in
+                    *-cloud-amd64) meta=cloud-amd64 ;;
+                    *-amd64) meta=amd64 ;;
+                    *-cloud-arm64) meta=cloud-arm64 ;;
+                    *-arm64) meta=arm64 ;;
+                    *) meta="" ;;
+                esac
+                if [[ -n "$meta" ]]; then
+                    echo "For a standard Debian kernel, run:" >&2
+                    echo "  apt-get install linux-image-${meta} linux-headers-${meta}" >&2
+                    echo "Then reboot into that kernel and run this script again." >&2
+                else
+                    echo "Install matching headers from your kernel/VPS provider, or boot a standard Debian kernel." >&2
+                fi
+            fi
+            exit 1
+        fi
+    fi
+    [[ -f "/lib/modules/${kernel}/build/Makefile" ]] || fail "Kernel headers are incomplete: /lib/modules/${kernel}/build/Makefile"
+}
+
+function verifyAmneziaWG() {
+    command -v awg >/dev/null || fail "awg was not installed."
+    command -v awg-quick >/dev/null || fail "awg-quick was not installed."
+    if [[ "$OS" == debian || "$OS" == ubuntu ]]; then
+        dkms autoinstall -k "$(uname -r)"
+        depmod -a "$(uname -r)"
+    fi
+    if ! modprobe amneziawg; then
+        echo "The AmneziaWG kernel module could not be loaded. Check DKMS and Secure Boot:" >&2
+        echo "  dkms status" >&2
+        echo "  journalctl -k -n 80 --no-pager" >&2
+        fail "Module load failed; no new VPN configuration has been generated."
+    fi
+}
+
+function startAmneziaWG() {
+    systemctl daemon-reload
+    if ! systemctl restart "awg-quick@${SERVER_AWG_NIC}"; then
+        journalctl -u "awg-quick@${SERVER_AWG_NIC}" -n 60 --no-pager >&2 || true
+        fail "AmneziaWG did not start. Check the error above (including protocol/tool/module compatibility)."
+    fi
+    systemctl is-active --quiet "awg-quick@${SERVER_AWG_NIC}" || fail "AmneziaWG service is inactive."
+    awg show "${SERVER_AWG_NIC}" >/dev/null || fail "AmneziaWG interface is missing."
+    systemctl enable "awg-quick@${SERVER_AWG_NIC}"
+}
 
 function isRoot() {
     if [ "${EUID}" -ne 0 ]; then
@@ -122,10 +328,10 @@ function readJminAndJmax() {
     SERVER_AWG_JMIN=0
     SERVER_AWG_JMAX=0
     until [[ ${SERVER_AWG_JMIN} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_JMIN} >= 1 )) && (( ${SERVER_AWG_JMIN} <= 1280 )); do
-        read -rp "Server AmneziaWG Jmin [1-1280]: " -e -i 40 SERVER_AWG_JMIN
+        read -rp "Server AmneziaWG Jmin [1-1280]: " -e -i 40 SERVER_AWG_JMIN || fail "Input closed; rerun the script from an interactive terminal."
     done
     until [[ ${SERVER_AWG_JMAX} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_JMAX} >= 1 )) && (( ${SERVER_AWG_JMAX} <= 1280 )); do
-        read -rp "Server AmneziaWG Jmax [1-1280]: " -e -i 70 SERVER_AWG_JMAX
+        read -rp "Server AmneziaWG Jmax [1-1280]: " -e -i 70 SERVER_AWG_JMAX || fail "Input closed; rerun the script from an interactive terminal."
     done
 }
 
@@ -164,7 +370,7 @@ function readSParams() {
         fi
     fi
     until [[ ${SERVER_AWG_S1} =~ ^[0-9]+$ ]] && (( SERVER_AWG_S1 >= min_s && SERVER_AWG_S1 <= 150 )); do
-        read -rp "Server AmneziaWG S1 [${min_s}-150]: " -e -i ${RANDOM_AWG_S1} SERVER_AWG_S1
+        read -rp "Server AmneziaWG S1 [${min_s}-150]: " -e -i ${RANDOM_AWG_S1} SERVER_AWG_S1 || fail "Input closed; rerun the script from an interactive terminal."
     done
     if [[ "${AWG_VERSION}" == "3.1" && "${SERVER_AWG_RANDOM_TRAILERS}" == "y" ]]; then
         default_s2=${SERVER_AWG_S1}
@@ -172,16 +378,16 @@ function readSParams() {
         default_s4=${SERVER_AWG_S1}
     fi
     until [[ ${SERVER_AWG_S2} =~ ^[0-9]+$ ]] && (( SERVER_AWG_S2 >= min_s && SERVER_AWG_S2 <= 150 )); do
-        read -rp "Server AmneziaWG S2 [${min_s}-150]: " -e -i ${default_s2} SERVER_AWG_S2
+        read -rp "Server AmneziaWG S2 [${min_s}-150]: " -e -i ${default_s2} SERVER_AWG_S2 || fail "Input closed; rerun the script from an interactive terminal."
     done
     if [[ "${AWG_VERSION}" != "1.0" ]]; then
         SERVER_AWG_S3=0
         SERVER_AWG_S4=0
         until [[ ${SERVER_AWG_S3} =~ ^[0-9]+$ ]] && (( SERVER_AWG_S3 >= min_s && SERVER_AWG_S3 <= 150 )); do
-            read -rp "Server AmneziaWG S3 [${min_s}-150]: " -e -i ${default_s3} SERVER_AWG_S3
+            read -rp "Server AmneziaWG S3 [${min_s}-150]: " -e -i ${default_s3} SERVER_AWG_S3 || fail "Input closed; rerun the script from an interactive terminal."
         done
         until [[ ${SERVER_AWG_S4} =~ ^[0-9]+$ ]] && (( SERVER_AWG_S4 >= min_s && SERVER_AWG_S4 <= 150 )); do
-            read -rp "Server AmneziaWG S4 [${min_s}-150]: " -e -i ${default_s4} SERVER_AWG_S4
+            read -rp "Server AmneziaWG S4 [${min_s}-150]: " -e -i ${default_s4} SERVER_AWG_S4 || fail "Input closed; rerun the script from an interactive terminal."
         done
     fi
 }
@@ -260,16 +466,16 @@ function readH1AndH2AndH3AndH4() {
         SERVER_AWG_H4=""
 
         until [[ -n "${SERVER_AWG_H1}" ]] && validateHValue "${SERVER_AWG_H1}" "${min_h}" >/dev/null; do
-            read -rp "Server AmneziaWG H1 [${min_h}-4294967295]: " -e -i "${RANDOM_AWG_H1}" SERVER_AWG_H1
+            read -rp "Server AmneziaWG H1 [${min_h}-4294967295]: " -e -i "${RANDOM_AWG_H1}" SERVER_AWG_H1 || fail "Input closed; rerun the script from an interactive terminal."
         done
         until [[ -n "${SERVER_AWG_H2}" ]] && validateHValue "${SERVER_AWG_H2}" "${min_h}" >/dev/null; do
-            read -rp "Server AmneziaWG H2 [${min_h}-4294967295]: " -e -i "${RANDOM_AWG_H2}" SERVER_AWG_H2
+            read -rp "Server AmneziaWG H2 [${min_h}-4294967295]: " -e -i "${RANDOM_AWG_H2}" SERVER_AWG_H2 || fail "Input closed; rerun the script from an interactive terminal."
         done
         until [[ -n "${SERVER_AWG_H3}" ]] && validateHValue "${SERVER_AWG_H3}" "${min_h}" >/dev/null; do
-            read -rp "Server AmneziaWG H3 [${min_h}-4294967295]: " -e -i "${RANDOM_AWG_H3}" SERVER_AWG_H3
+            read -rp "Server AmneziaWG H3 [${min_h}-4294967295]: " -e -i "${RANDOM_AWG_H3}" SERVER_AWG_H3 || fail "Input closed; rerun the script from an interactive terminal."
         done
         until [[ -n "${SERVER_AWG_H4}" ]] && validateHValue "${SERVER_AWG_H4}" "${min_h}" >/dev/null; do
-            read -rp "Server AmneziaWG H4 [${min_h}-4294967295]: " -e -i "${RANDOM_AWG_H4}" SERVER_AWG_H4
+            read -rp "Server AmneziaWG H4 [${min_h}-4294967295]: " -e -i "${RANDOM_AWG_H4}" SERVER_AWG_H4 || fail "Input closed; rerun the script from an interactive terminal."
         done
 
         local overlap_code=0
@@ -323,7 +529,7 @@ function readIParams() {
     for i in 1 2 3 4 5; do
         local input=""
         while true; do
-            read -rp "AmneziaWG I${i} [optional, Enter to finish]: " -e input
+            read -rp "AmneziaWG I${i} [optional, Enter to finish]: " -e input || fail "Input closed; rerun the script from an interactive terminal."
             input=$(echo "${input}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             if [[ -z "${input}" ]]; then
                 return 0
@@ -381,17 +587,37 @@ function installQuestions() {
     ALLOWED_IPS=""
     KEEPALIVE=""
 
-    # Detect public IPv4 or IPv6 address and pre-fill for the user
-    SERVER_PUB_IP=$(ip -4 addr | sed -ne 's|^.* inet \([^/]*\)/.* scope global.*$|\1|p' | awk '{print $1}' | head -1)
-    if [[ -z ${SERVER_PUB_IP} ]]; then
-        SERVER_PUB_IP=$(ip -6 addr | sed -ne 's|^.* inet6 \([^/]*\)/.* scope global.*$|\1|p' | head -1)
+    # Public endpoint remains editable; the IPv4 is also used to derive WGIP.
+    local detected_ipv4 real_ipv4
+    detected_ipv4=$(detectPublicIPv4) || detected_ipv4=""
+    SERVER_PUB_IP="$detected_ipv4"
+    if [[ -z "$SERVER_PUB_IP" ]]; then
+        SERVER_PUB_IP=$(ip -6 addr show scope global | awk '/inet6/ {sub(/\/.*/, "", $2); print $2; exit}')
     fi
-    read -rp "Public IPv4 or IPv6 address or domain: " -e -i "${SERVER_PUB_IP}" SERVER_PUB_IP
+    while true; do
+        read -rp "Public IPv4 or IPv6 address or domain: " -e -i "$SERVER_PUB_IP" SERVER_PUB_IP || fail "Input closed."
+        SERVER_PUB_IP=${SERVER_PUB_IP#[}
+        SERVER_PUB_IP=${SERVER_PUB_IP%]}
+        if [[ -n "$SERVER_PUB_IP" && "$SERVER_PUB_IP" =~ ^[a-zA-Z0-9.:_-]+$ ]]; then
+            break
+        fi
+        echo "Invalid public endpoint. Enter an IP address or hostname."
+    done
+    if publicIPv4 "$SERVER_PUB_IP"; then
+        real_ipv4="$SERVER_PUB_IP"
+    else
+        real_ipv4="$detected_ipv4"
+    fi
+    until publicIPv4 "$real_ipv4"; do
+        read -rp "Real public IPv4 for subnet calculation (10.xx.yy.1): " real_ipv4 || fail "Public IPv4 is required."
+    done
+    deriveWGIP "$real_ipv4" || fail "Cannot calculate WGIP."
+    echo "Public IPv4: ${real_ipv4}; default VPN address: ${WGIP}/24"
 
     # Generate random number within private ports range
     RANDOM_PORT=$(shuf -i49152-65535 -n1)
     until [[ ${SERVER_PORT} =~ ^[0-9]+$ ]] && [ "${SERVER_PORT}" -ge 1 ] && [ "${SERVER_PORT}" -le 65535 ]; do
-        read -rp "Server AmneziaWG port [1-65535]: " -e -i "${RANDOM_PORT}" SERVER_PORT
+        read -rp "Server AmneziaWG port [1-65535]: " -e -i "${RANDOM_PORT}" SERVER_PORT || fail "Input closed; rerun the script from an interactive terminal."
     done
 
     # Select DNS resolver
@@ -402,7 +628,7 @@ function installQuestions() {
     echo "   3) Google DNS (8.8.8.8, 8.8.4.4)"
     echo "   4) Custom DNS"
     until [[ ${DNS_CHOICE} =~ ^[1-4]$ ]]; do
-        read -rp "DNS resolver [1-4]: " -e -i 1 DNS_CHOICE
+        read -rp "DNS resolver [1-4]: " -e -i 1 DNS_CHOICE || fail "Input closed; rerun the script from an interactive terminal."
     done
     case "${DNS_CHOICE}" in
     1)
@@ -425,10 +651,10 @@ function installQuestions() {
         ;;
     4)
         until [[ ${CLIENT_IPV4_DNS_1} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
-            read -rp "First IPv4 DNS resolver to use for the clients: " -e -i 1.1.1.1 CLIENT_IPV4_DNS_1
+            read -rp "First IPv4 DNS resolver to use for the clients: " -e -i 1.1.1.1 CLIENT_IPV4_DNS_1 || fail "Input closed; rerun the script from an interactive terminal."
         done
         until [[ ${CLIENT_IPV4_DNS_2} =~ ^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$ ]]; do
-            read -rp "Second IPv4 DNS resolver to use for the clients (optional): " -e -i 1.0.0.1 CLIENT_IPV4_DNS_2
+            read -rp "Second IPv4 DNS resolver to use for the clients (optional): " -e -i 1.0.0.1 CLIENT_IPV4_DNS_2 || fail "Input closed; rerun the script from an interactive terminal."
         done
         ;;
     esac
@@ -440,7 +666,7 @@ function installQuestions() {
     echo "   2) AmneziaWG 2.0 (Compatibility with KeeneticOS / OpenWrt / routers)"
     echo "   3) AmneziaWG 1.0 (Legacy)"
     until [[ ${AWG_VERSION_CHOICE} =~ ^[1-3]$ ]]; do
-        read -rp "Protocol version [1-3]: " -e -i 1 AWG_VERSION_CHOICE
+        read -rp "Protocol version [1-3]: " -e -i 1 AWG_VERSION_CHOICE || fail "Input closed; rerun the script from an interactive terminal."
     done
     case "${AWG_VERSION_CHOICE}" in
     1) AWG_VERSION="3.1" ;;
@@ -451,7 +677,7 @@ function installQuestions() {
     # Advanced settings toggle
     echo ""
     until [[ ${ADVANCED_SETTINGS} =~ ^[yn]$ ]]; do
-        read -rp "Customize advanced settings (IPv6, interface, firewall, obfuscation)? [y/n]: " -e -i n ADVANCED_SETTINGS
+        read -rp "Customize advanced settings (IPv6, interface, firewall, obfuscation)? [y/n]: " -e -i n ADVANCED_SETTINGS || fail "Input closed; rerun the script from an interactive terminal."
         ADVANCED_SETTINGS=${ADVANCED_SETTINGS,,}
     done
 
@@ -460,6 +686,8 @@ function installQuestions() {
     if [[ -z ${SERVER_NIC} ]]; then
         SERVER_NIC="$(ip -6 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)"
     fi
+
+    [[ -n "$SERVER_NIC" ]] || fail "No default network interface found."
 
     # Pre-generate base obfuscation parameters
     RANDOM_AWG_JC=$(shuf -i4-8 -n1)
@@ -483,49 +711,49 @@ function installQuestions() {
             DEFAULT_MTU=1420
         fi
         until [[ ${SERVER_AWG_MTU} =~ ^[0-9]+$ ]] && (( SERVER_AWG_MTU >= 576 && SERVER_AWG_MTU <= 1500 )); do
-            read -rp "AmneziaWG MTU [576-1500]: " -e -i "${DEFAULT_MTU}" SERVER_AWG_MTU
+            read -rp "AmneziaWG MTU [576-1500]: " -e -i "${DEFAULT_MTU}" SERVER_AWG_MTU || fail "Input closed; rerun the script from an interactive terminal."
         done
 
         until [[ ${USE_IPV6} =~ ^[yn]$ ]]; do
-            read -rp "Do you want to use IPv6? [y/n]: " -e -i n USE_IPV6
+            read -rp "Do you want to use IPv6? [y/n]: " -e -i n USE_IPV6 || fail "Input closed; rerun the script from an interactive terminal."
             USE_IPV6=${USE_IPV6,,}
         done
 
         until [[ ${SERVER_PUB_NIC} =~ ^[a-zA-Z0-9_]+$ ]]; do
-            read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC
+            read -rp "Public interface: " -e -i "${SERVER_NIC}" SERVER_PUB_NIC || fail "Input closed; rerun the script from an interactive terminal."
         done
 
         until [[ ${SERVER_AWG_NIC} =~ ^[a-zA-Z0-9_]+$ && ${#SERVER_AWG_NIC} -lt 16 ]]; do
-            read -rp "AmneziaWG interface name: " -e -i awg0 SERVER_AWG_NIC
+            read -rp "AmneziaWG interface name: " -e -i awg0 SERVER_AWG_NIC || fail "Input closed; rerun the script from an interactive terminal."
         done
 
-        until [[ ${SERVER_AWG_IPV4} =~ ^([0-9]{1,3}\.){3} ]]; do
-            read -rp "Server AmneziaWG IPv4: " -e -i 10.66.66.1 SERVER_AWG_IPV4
+        until validIPv4 "$SERVER_AWG_IPV4" && [[ "${SERVER_AWG_IPV4##*.}" != 0 && "${SERVER_AWG_IPV4##*.}" != 255 ]]; do
+            read -rp "Server AmneziaWG IPv4: " -e -i ${WGIP} SERVER_AWG_IPV4 || fail "Input closed; rerun the script from an interactive terminal."
         done
 
         if [[ ${USE_IPV6} == 'y' ]]; then
             until [[ ${SERVER_AWG_IPV6} =~ ^([a-f0-9]{1,4}:){3,4}: ]]; do
-                read -rp "Server AmneziaWG IPv6: " -e -i fd42:42:42::1 SERVER_AWG_IPV6
+                read -rp "Server AmneziaWG IPv6: " -e -i fd42:42:42::1 SERVER_AWG_IPV6 || fail "Input closed; rerun the script from an interactive terminal."
             done
 
             if [[ ${DNS_CHOICE} == '4' ]]; then
                 until [[ ${CLIENT_IPV6_DNS_1} =~ ^([a-f0-9]{1,4}:){3,4}: ]]; do
-                    read -rp "First IPv6 DNS resolver to use for the clients: " -e -i 2606:4700:4700::1111 CLIENT_IPV6_DNS_1
+                    read -rp "First IPv6 DNS resolver to use for the clients: " -e -i 2606:4700:4700::1111 CLIENT_IPV6_DNS_1 || fail "Input closed; rerun the script from an interactive terminal."
                 done
 
                 until [[ ${CLIENT_IPV6_DNS_2} =~ ^([a-f0-9]{1,4}:){3,4}: ]]; do
-                    read -rp "Second IPv6 DNS resolver to use for the clients (optional): " -e -i 2606:4700:4700::1001 CLIENT_IPV6_DNS_2
+                    read -rp "Second IPv6 DNS resolver to use for the clients (optional): " -e -i 2606:4700:4700::1001 CLIENT_IPV6_DNS_2 || fail "Input closed; rerun the script from an interactive terminal."
                 done
             fi
         fi
 
         until [[ ${STORE_CLIENT} =~ ^[yn]$ ]]; do
-            read -rp "Store client config file at ${AMNEZIAWG_DIR}? [y/n]: " -e -i y STORE_CLIENT
+            read -rp "Store client config file at ${AMNEZIAWG_DIR}? [y/n]: " -e -i y STORE_CLIENT || fail "Input closed; rerun the script from an interactive terminal."
             STORE_CLIENT=${STORE_CLIENT,,}
         done
 
         until [[ ${USE_NFTABLES} =~ ^[yn]$ ]]; do
-            read -rp "Use nftables instead of iptables? [y/n]: " -e -i y USE_NFTABLES
+            read -rp "Use nftables instead of iptables? [y/n]: " -e -i y USE_NFTABLES || fail "Input closed; rerun the script from an interactive terminal."
             USE_NFTABLES=${USE_NFTABLES,,}
         done
 
@@ -534,7 +762,7 @@ function installQuestions() {
             POSSIBLE_ALLOWED_IPS="${POSSIBLE_ALLOWED_IPS}, ::/0"
         fi
         until [[ ${ALLOWED_IPS} =~ ^.+$ ]]; do
-            read -rp "Allowed IPs list for generated clients (leave default to route everything): " -e -i "$POSSIBLE_ALLOWED_IPS" ALLOWED_IPS
+            read -rp "Allowed IPs list for generated clients (leave default to route everything): " -e -i "$POSSIBLE_ALLOWED_IPS" ALLOWED_IPS || fail "Input closed; rerun the script from an interactive terminal."
         if [[ ${ALLOWED_IPS} == "" ]]; then
             ALLOWED_IPS="$POSSIBLE_ALLOWED_IPS"
         fi
@@ -542,12 +770,12 @@ function installQuestions() {
 
         # Keepalive interval
         until [[ ${KEEPALIVE} =~ ^[0-9]+$ ]] && [ "${KEEPALIVE}" -ge 0 ] && [ "${KEEPALIVE}" -le 65535 ]; do
-            read -rp "Keepalive interval [0-65535]: " -e -i 0 KEEPALIVE
+            read -rp "Keepalive interval [0-65535]: " -e -i 0 KEEPALIVE || fail "Input closed; rerun the script from an interactive terminal."
         done
 
         # Jc
         until [[ ${SERVER_AWG_JC} =~ ^[0-9]+$ ]] && (( ${SERVER_AWG_JC} >= 1 )) && (( ${SERVER_AWG_JC} <= 128 )); do
-            read -rp "Server AmneziaWG Jc [1-128]: " -e -i ${RANDOM_AWG_JC} SERVER_AWG_JC
+            read -rp "Server AmneziaWG Jc [1-128]: " -e -i ${RANDOM_AWG_JC} SERVER_AWG_JC || fail "Input closed; rerun the script from an interactive terminal."
         done
 
         # Jmin && Jmax
@@ -563,24 +791,24 @@ function installQuestions() {
             echo "Leave 'auto' to automatically generate via 'awg genkey' during installation,"
             echo "or provide a custom 32-byte Base64 key."
             until [[ "${SERVER_AWG_HPK}" == "auto" || "${SERVER_AWG_HPK}" =~ ^[A-Za-z0-9+/]{43}=$ || "${SERVER_AWG_HPK}" =~ ^[A-Za-z0-9+/]{44}$ ]]; do
-                read -rp "HeaderProtectionKey [auto or 32-byte base64]: " -e -i auto SERVER_AWG_HPK
+                read -rp "HeaderProtectionKey [auto or 32-byte base64]: " -e -i auto SERVER_AWG_HPK || fail "Input closed; rerun the script from an interactive terminal."
             done
 
             until [[ "${SERVER_AWG_CPA}" =~ ^[0-9]+(-[0-9]+)?$ ]]; do
-                read -rp "ContentPaddingAddition [e.g. 16-64]: " -e -i "16-64" SERVER_AWG_CPA
+                read -rp "ContentPaddingAddition [e.g. 16-64]: " -e -i "16-64" SERVER_AWG_CPA || fail "Input closed; rerun the script from an interactive terminal."
             done
 
             echo ""
             echo "RandomTrailers appends random-length padding to packets to disrupt size profiling (AmneziaWG 3.1+)."
             until [[ ${SERVER_AWG_RANDOM_TRAILERS} =~ ^[yn]$ ]]; do
-                read -rp "Enable RandomTrailers? [y/n]: " -e -i y SERVER_AWG_RANDOM_TRAILERS
+                read -rp "Enable RandomTrailers? [y/n]: " -e -i y SERVER_AWG_RANDOM_TRAILERS || fail "Input closed; rerun the script from an interactive terminal."
                 SERVER_AWG_RANDOM_TRAILERS=${SERVER_AWG_RANDOM_TRAILERS,,}
             done
 
             echo ""
             echo "DisableCookies disables handshake cookie replies to evade active DPI probing (AmneziaWG 3.1+)."
             until [[ ${SERVER_AWG_DISABLE_COOKIES} =~ ^[yn]$ ]]; do
-                read -rp "Enable DisableCookies? [y/n]: " -e -i y SERVER_AWG_DISABLE_COOKIES
+                read -rp "Enable DisableCookies? [y/n]: " -e -i y SERVER_AWG_DISABLE_COOKIES || fail "Input closed; rerun the script from an interactive terminal."
                 SERVER_AWG_DISABLE_COOKIES=${SERVER_AWG_DISABLE_COOKIES,,}
             done
         else
@@ -622,9 +850,9 @@ function installQuestions() {
     else
         # Standard mode automatic defaults
         USE_IPV6="n"
-        SERVER_PUB_NIC="${SERVER_NIC:-eth0}"
+        SERVER_PUB_NIC="${SERVER_NIC}"
         SERVER_AWG_NIC="awg0"
-        SERVER_AWG_IPV4="10.66.66.1"
+        SERVER_AWG_IPV4="${WGIP}"
         STORE_CLIENT="y"
         USE_NFTABLES="y"
         ALLOWED_IPS="0.0.0.0/0"
@@ -687,22 +915,21 @@ function installQuestions() {
     echo "Okay, that was all I needed. Ready to setup your AmneziaWG server now."
 }
 
-function installAmneziaWG() {
-    # Run setup questions first
-    installQuestions
-
+function installPackages() {
     if [[ ${USE_NFTABLES} == 'y' ]]; then NF_PACKAGE="nftables"; else NF_PACKAGE="iptables"; fi
 
     # Install AmneziaWG tools and module
     if [[ ${OS} == 'ubuntu' ]]; then
-        apt-get update
-        apt-get install -y software-properties-common "linux-headers-$(uname -r)"
+        apt-get update -o APT::Update::Error-Mode=any
+        apt-get install -y software-properties-common ca-certificates curl gnupg dkms build-essential kmod iproute2
+        ensureKernelHeaders
         add-apt-repository -y ppa:amnezia/ppa
-        apt-get update
-        apt-get install -y amneziawg amneziawg-tools qrencode ${NF_PACKAGE}
+        apt-get update -o APT::Update::Error-Mode=any
+        apt-get install -y amneziawg-dkms amneziawg-tools qrencode "${NF_PACKAGE}"
     elif [[ ${OS} == 'debian' ]]; then
-        apt-get update
-        apt-get install -y "linux-headers-$(uname -r)" curl gnupg
+        apt-get update -o APT::Update::Error-Mode=any
+        apt-get install -y ca-certificates curl gnupg dkms build-essential kmod iproute2
+        ensureKernelHeaders
 
         MAJOR_VERSION=$(echo "$VERSION_ID" | cut -d'.' -f1)
         case "$MAJOR_VERSION" in
@@ -711,15 +938,24 @@ function installAmneziaWG() {
         esac
 
         install -d -m 755 /etc/apt/keyrings
-        curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x57290828" | gpg --dearmor --yes -o "/etc/apt/keyrings/amneziawg-keyring.gpg"
+        local key_file key_fingerprint
+        key_file=$(mktemp)
+        curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
+            "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x75C9DD72C799870E310542E24166F2C257290828" -o "$key_file"
+        key_fingerprint=$(gpg --batch --show-keys --with-colons "$key_file" | awk -F: '$1=="fpr" {print $10; exit}')
+        [[ "$key_fingerprint" == 75C9DD72C799870E310542E24166F2C257290828 ]] || fail "Unexpected Amnezia PPA key fingerprint."
+        gpg --batch --dearmor --yes -o /etc/apt/keyrings/amneziawg-keyring.gpg "$key_file"
+        rm -f "$key_file"
+        chmod 644 /etc/apt/keyrings/amneziawg-keyring.gpg
         echo "Types: deb deb-src
 URIs: https://ppa.launchpadcontent.net/amnezia/ppa/ubuntu
 Suites: ${UBUNTU_SUITE}
 Components: main
 Signed-By: /etc/apt/keyrings/amneziawg-keyring.gpg
 " > "/etc/apt/sources.list.d/amneziawg.sources"
-        apt-get update
-        apt-get install -y amneziawg amneziawg-tools qrencode ${NF_PACKAGE}
+        chmod 644 /etc/apt/sources.list.d/amneziawg.sources
+        apt-get update -o APT::Update::Error-Mode=any
+        apt-get install -y amneziawg-dkms amneziawg-tools qrencode "${NF_PACKAGE}"
     elif [[ ${OS} == 'fedora' ]]; then
         dnf copr enable -y tigro/amneziawg
         dnf install -y amneziawg-kmod amneziawg-tools qrencode bc ${NF_PACKAGE}
@@ -738,6 +974,38 @@ Signed-By: /etc/apt/keyrings/amneziawg-keyring.gpg
         fi
     fi
 
+    verifyAmneziaWG
+}
+
+function installAmneziaWG() {
+    # Restrict fail-fast to setup; management uses grep exit 1 for empty lists.
+    set -Ee
+    trap 'setupError "$?" "$LINENO"' ERR
+    trap 'rollbackSetup "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    umask 077
+    if [[ "$OS" == debian || "$OS" == ubuntu ]]; then
+        apt-get update -o APT::Update::Error-Mode=any
+        apt-get install -y ca-certificates curl iproute2
+    fi
+    installQuestions
+    checkNetworkConflicts
+    installPackages
+    install -d -m 700 "$AMNEZIAWG_DIR"
+    # Preserve remnants from an earlier failed setup before writing new keys.
+    if [[ -e "${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf" || -e "${AMNEZIAWG_DIR}/params.pending" ]]; then
+        local previous_dir
+        previous_dir=$(mktemp -d "${AMNEZIAWG_DIR}/before-setup.XXXXXX")
+        local previous_file
+        for previous_file in "${SERVER_AWG_NIC}.conf" params.pending nft.sh; do
+            if [[ -f "${AMNEZIAWG_DIR}/${previous_file}" ]]; then
+                cp -p "${AMNEZIAWG_DIR}/${previous_file}" "$previous_dir/"
+            fi
+        done
+        echo "Previous incomplete configuration saved to ${previous_dir}"
+    fi
+
     SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
 
     # Deferred generation of HeaderProtectionKey for AWG 3.1
@@ -750,51 +1018,11 @@ Signed-By: /etc/apt/keyrings/amneziawg-keyring.gpg
     SERVER_PRIV_KEY=$(awg genkey)
     SERVER_PUB_KEY=$(echo "${SERVER_PRIV_KEY}" | awg pubkey)
 
-    SERVER_AWG_IPS="SERVER_AWG_IPV4=${SERVER_AWG_IPV4}"
-
-    if [[ "$USE_IPV6" = 'y' ]]; then
-        SERVER_AWG_IPS="${SERVER_AWG_IPS}\nSERVER_AWG_IPV6=${SERVER_AWG_IPV6}"
-    fi
-
-    # Save AmneziaWG settings
-    echo -e "${SERVER_AWG_IPS}
-AWG_VERSION=${AWG_VERSION}
-SERVER_AWG_MTU=${SERVER_AWG_MTU}
-SERVER_AWG_HPK=${SERVER_AWG_HPK}
-SERVER_AWG_CPA=${SERVER_AWG_CPA}
-SERVER_AWG_RANDOM_TRAILERS=${SERVER_AWG_RANDOM_TRAILERS}
-SERVER_AWG_DISABLE_COOKIES=${SERVER_AWG_DISABLE_COOKIES}
-SERVER_AWG_I1=\"${SERVER_AWG_I1}\"
-SERVER_AWG_I2=\"${SERVER_AWG_I2}\"
-SERVER_AWG_I3=\"${SERVER_AWG_I3}\"
-SERVER_AWG_I4=\"${SERVER_AWG_I4}\"
-SERVER_AWG_I5=\"${SERVER_AWG_I5}\"
-SERVER_PUB_IP=${SERVER_PUB_IP}
-SERVER_PUB_NIC=${SERVER_PUB_NIC}
-SERVER_AWG_NIC=${SERVER_AWG_NIC}
-SERVER_PORT=${SERVER_PORT}
-SERVER_PRIV_KEY=${SERVER_PRIV_KEY}
-SERVER_PUB_KEY=${SERVER_PUB_KEY}
-CLIENT_IPV4_DNS_1=${CLIENT_IPV4_DNS_1}
-CLIENT_IPV4_DNS_2=${CLIENT_IPV4_DNS_2}
-CLIENT_IPV6_DNS_1=${CLIENT_IPV6_DNS_1}
-CLIENT_IPV6_DNS_2=${CLIENT_IPV6_DNS_2}
-STORE_CLIENT=${STORE_CLIENT}
-USE_IPV6=${USE_IPV6}
-USE_NFTABLES=${USE_NFTABLES}
-ALLOWED_IPS=\"${ALLOWED_IPS}\"
-KEEPALIVE=${KEEPALIVE}
-SERVER_AWG_JC=${SERVER_AWG_JC}
-SERVER_AWG_JMIN=${SERVER_AWG_JMIN}
-SERVER_AWG_JMAX=${SERVER_AWG_JMAX}
-SERVER_AWG_S1=${SERVER_AWG_S1}
-SERVER_AWG_S2=${SERVER_AWG_S2}
-SERVER_AWG_S3=${SERVER_AWG_S3}
-SERVER_AWG_S4=${SERVER_AWG_S4}
-SERVER_AWG_H1=${SERVER_AWG_H1}
-SERVER_AWG_H2=${SERVER_AWG_H2}
-SERVER_AWG_H3=${SERVER_AWG_H3}
-SERVER_AWG_H4=${SERVER_AWG_H4}" > "${AMNEZIAWG_DIR}/params"
+    # Shell-escape every value: params is sourced when managing/recovering setup.
+    local param
+    for param in AWG_VERSION SERVER_AWG_IPV4 SERVER_AWG_IPV6 SERVER_AWG_MTU SERVER_AWG_HPK SERVER_AWG_CPA SERVER_AWG_RANDOM_TRAILERS SERVER_AWG_DISABLE_COOKIES SERVER_AWG_I1 SERVER_AWG_I2 SERVER_AWG_I3 SERVER_AWG_I4 SERVER_AWG_I5 SERVER_PUB_IP SERVER_PUB_NIC SERVER_AWG_NIC SERVER_PORT SERVER_PRIV_KEY SERVER_PUB_KEY CLIENT_IPV4_DNS_1 CLIENT_IPV4_DNS_2 CLIENT_IPV6_DNS_1 CLIENT_IPV6_DNS_2 STORE_CLIENT USE_IPV6 USE_NFTABLES ALLOWED_IPS KEEPALIVE SERVER_AWG_JC SERVER_AWG_JMIN SERVER_AWG_JMAX SERVER_AWG_S1 SERVER_AWG_S2 SERVER_AWG_S3 SERVER_AWG_S4 SERVER_AWG_H1 SERVER_AWG_H2 SERVER_AWG_H3 SERVER_AWG_H4; do
+        printf '%s=%q\n' "$param" "${!param}"
+    done > "${AMNEZIAWG_DIR}/params.pending"
 
     # Add server interface
     SERVER_ADDRESS="${SERVER_AWG_IPV4}/24"
@@ -808,6 +1036,9 @@ Address = ${SERVER_ADDRESS}
 ListenPort = ${SERVER_PORT}
 PrivateKey = ${SERVER_PRIV_KEY}
 MTU = ${SERVER_AWG_MTU}
+Jc = ${SERVER_AWG_JC}
+Jmin = ${SERVER_AWG_JMIN}
+Jmax = ${SERVER_AWG_JMAX}
 S1 = ${SERVER_AWG_S1}
 S2 = ${SERVER_AWG_S2}" >"${SERVER_AWG_CONF}"
 
@@ -849,16 +1080,16 @@ PostUp = firewall-cmd --zone=public --add-port=${SERVER_PORT}/udp" >>"${SERVER_A
 
         echo "PostUp = firewall-cmd --direct --add-rule ipv4 filter FORWARD 0 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = firewall-cmd --direct --add-rule ipv4 filter FORWARD 0 -i ${SERVER_AWG_NIC} -o ${SERVER_PUB_NIC} -j ACCEPT
-PostUp = firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = firewall-cmd --direct --add-rule ipv4 nat POSTROUTING 0 -s ${SERVER_AWG_IPV4%.*}.0/24 -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = firewall-cmd --direct --remove-rule ipv4 nat POSTROUTING 0 -s ${SERVER_AWG_IPV4%.*}.0/24 -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = firewall-cmd --direct --remove-rule ipv4 filter FORWARD 0 -i ${SERVER_AWG_NIC} -o ${SERVER_PUB_NIC} -j ACCEPT
 PostDown = firewall-cmd --direct --remove-rule ipv4 filter FORWARD 0 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT" >>"${SERVER_AWG_CONF}"
 
         if [[ "$USE_IPV6" = 'y' ]]; then
             echo "PostUp = firewall-cmd --direct --add-rule ipv6 filter FORWARD 0 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = firewall-cmd --direct --add-rule ipv6 filter FORWARD 0 -i ${SERVER_AWG_NIC} -o ${SERVER_PUB_NIC} -j ACCEPT
-PostUp = firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -o ${SERVER_PUB_NIC} -j MASQUERADE
-PostDown = firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = firewall-cmd --direct --add-rule ipv6 nat POSTROUTING 0 -s ${SERVER_AWG_IPV6%::*}::/64 -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostDown = firewall-cmd --direct --remove-rule ipv6 nat POSTROUTING 0 -s ${SERVER_AWG_IPV6%::*}::/64 -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = firewall-cmd --direct --remove-rule ipv6 filter FORWARD 0 -i ${SERVER_AWG_NIC} -o ${SERVER_PUB_NIC} -j ACCEPT
 PostDown = firewall-cmd --direct --remove-rule ipv6 filter FORWARD 0 -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT" >>"${SERVER_AWG_CONF}"
         fi
@@ -869,32 +1100,43 @@ PostDown = firewall-cmd --zone=public --remove-interface=${SERVER_AWG_NIC}" >>"$
         NFTABLES_SCRIPT_PATH="${AMNEZIAWG_DIR}/nft.sh"
         cat << 'EOF' > "${NFTABLES_SCRIPT_PATH}"
 #!/bin/bash
+set -euo pipefail
 ACTION="$1"
 PORT="$2"
 PUB_NIC="$3"
 AWG_NIC="$4"
 TABLE_NAME="awg_${AWG_NIC}"
+VPN_NET="${5:-}"
+VPN_NET6="${6:-}"
 
 if [[ "${ACTION}" == 'up' ]]; then
-    # Create self-contained table for AmneziaWG
-    nft delete table inet "${TABLE_NAME}" 2>/dev/null || true
-    nft add table inet "${TABLE_NAME}"
-    nft add chain inet "${TABLE_NAME}" input "{ type filter hook input priority filter; policy accept; }"
-    nft add rule inet "${TABLE_NAME}" input udp dport "${PORT}" accept
-    nft add chain inet "${TABLE_NAME}" forward "{ type filter hook forward priority filter; policy accept; }"
-    nft add rule inet "${TABLE_NAME}" forward iifname "${AWG_NIC}" accept
-    nft add rule inet "${TABLE_NAME}" forward iifname "${PUB_NIC}" oifname "${AWG_NIC}" accept
-    nft add chain inet "${TABLE_NAME}" postrouting "{ type nat hook postrouting priority srcnat; policy accept; }"
-    nft add rule inet "${TABLE_NAME}" postrouting oifname "${PUB_NIC}" masquerade
+    [[ "$VPN_NET" =~ ^([0-9]{1,3}\.){3}0/24$ ]] || { echo "Missing VPN subnet" >&2; exit 1; }
+    # One transaction; do not flush any other service's tables or policies.
+    {
+        cat <<RULES
+add table inet ${TABLE_NAME}
+flush table inet ${TABLE_NAME}
+add chain inet ${TABLE_NAME} input { type filter hook input priority filter; policy accept; }
+add rule inet ${TABLE_NAME} input udp dport ${PORT} accept
+add chain inet ${TABLE_NAME} forward { type filter hook forward priority filter; policy accept; }
+add rule inet ${TABLE_NAME} forward iifname "${AWG_NIC}" oifname "${PUB_NIC}" accept
+add rule inet ${TABLE_NAME} forward iifname "${PUB_NIC}" oifname "${AWG_NIC}" ct state established,related accept
+add chain inet ${TABLE_NAME} postrouting { type nat hook postrouting priority srcnat; policy accept; }
+add rule inet ${TABLE_NAME} postrouting ip saddr ${VPN_NET} oifname "${PUB_NIC}" masquerade
+RULES
+        if [[ -n "$VPN_NET6" ]]; then
+            printf 'add rule inet %s postrouting ip6 saddr %s oifname "%s" masquerade\n' "$TABLE_NAME" "$VPN_NET6" "$PUB_NIC"
+        fi
+    } | nft -f -
 
     # Also allow in inet filter if an existing firewall table is present
     if nft list table inet filter >/dev/null 2>&1; then
         if nft list chain inet filter input >/dev/null 2>&1; then
-            nft add rule inet filter input udp dport "${PORT}" comment "${TABLE_NAME}" accept
+            nft insert rule inet filter input udp dport "${PORT}" accept comment "\"${TABLE_NAME}\""
         fi
         if nft list chain inet filter forward >/dev/null 2>&1; then
-            nft add rule inet filter forward iifname "${AWG_NIC}" comment "${TABLE_NAME}" accept
-            nft add rule inet filter forward iifname "${PUB_NIC}" oifname "${AWG_NIC}" comment "${TABLE_NAME}" accept
+            nft insert rule inet filter forward iifname "${AWG_NIC}" accept comment "\"${TABLE_NAME}\""
+            nft insert rule inet filter forward iifname "${PUB_NIC}" oifname "${AWG_NIC}" accept comment "\"${TABLE_NAME}\""
         fi
     fi
 elif [[ "${ACTION}" == 'down' ]]; then
@@ -902,7 +1144,7 @@ elif [[ "${ACTION}" == 'down' ]]; then
     if nft list table inet filter >/dev/null 2>&1; then
         for chain in input forward; do
             if nft list chain inet filter "${chain}" >/dev/null 2>&1; then
-                nft -a list chain inet filter "${chain}" | grep -E 'comment "'${TABLE_NAME}'"' | awk '{print $NF}' | while read -r handle; do
+                nft -a list chain inet filter "${chain}" | awk -v marker="$TABLE_NAME" 'index($0, "comment \"" marker "\"") {print $NF}' | while read -r handle; do
                     nft delete rule inet filter "${chain}" handle "${handle}" 2>/dev/null || true
                 done
             fi
@@ -914,41 +1156,39 @@ elif [[ "${ACTION}" == 'down' ]]; then
 fi
 EOF
         chmod +x "${NFTABLES_SCRIPT_PATH}"
-        echo "PostUp = ${NFTABLES_SCRIPT_PATH} up ${SERVER_PORT} ${SERVER_PUB_NIC} ${SERVER_AWG_NIC}
+        local vpn_net6=""
+        if [[ "$USE_IPV6" == y ]]; then vpn_net6="${SERVER_AWG_IPV6%::*}::/64"; fi
+        echo "PostUp = ${NFTABLES_SCRIPT_PATH} up ${SERVER_PORT} ${SERVER_PUB_NIC} ${SERVER_AWG_NIC} ${SERVER_AWG_IPV4%.*}.0/24 ${vpn_net6}
 PreDown = ${NFTABLES_SCRIPT_PATH} down ${SERVER_PORT} ${SERVER_PUB_NIC} ${SERVER_AWG_NIC}" >>"${SERVER_AWG_CONF}"
     else
         echo "PostUp = iptables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = iptables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
-PostUp = iptables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = iptables -t nat -A POSTROUTING -s ${SERVER_AWG_IPV4%.*}.0/24 -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = iptables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
-PostDown = iptables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >> "${SERVER_AWG_CONF}"
+PostDown = iptables -t nat -D POSTROUTING -s ${SERVER_AWG_IPV4%.*}.0/24 -o ${SERVER_PUB_NIC} -j MASQUERADE" >> "${SERVER_AWG_CONF}"
 
         if [[ "$USE_IPV6" = 'y' ]]; then
             echo "PostUp = ip6tables -I INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostUp = ip6tables -I FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostUp = ip6tables -I FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
-PostUp = ip6tables -t nat -A POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE
+PostUp = ip6tables -t nat -A POSTROUTING -s ${SERVER_AWG_IPV6%::*}::/64 -o ${SERVER_PUB_NIC} -j MASQUERADE
 PostDown = ip6tables -D INPUT -p udp --dport ${SERVER_PORT} -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_PUB_NIC} -o ${SERVER_AWG_NIC} -j ACCEPT
 PostDown = ip6tables -D FORWARD -i ${SERVER_AWG_NIC} -j ACCEPT
-PostDown = ip6tables -t nat -D POSTROUTING -o ${SERVER_PUB_NIC} -j MASQUERADE" >> "${SERVER_AWG_CONF}"  
+PostDown = ip6tables -t nat -D POSTROUTING -s ${SERVER_AWG_IPV6%::*}::/64 -o ${SERVER_PUB_NIC} -j MASQUERADE" >> "${SERVER_AWG_CONF}"  
         fi
     fi
 
-    # Enable routing on the server
-    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/awg.conf
-
-    if [[ "$USE_IPV6" = 'y' ]]; then
-        echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.d/awg.conf
-    fi
-
-    sysctl --system
-
-    systemctl start "awg-quick@${SERVER_AWG_NIC}"
-    systemctl enable "awg-quick@${SERVER_AWG_NIC}"
+    enableForwarding
+    chmod 600 "$SERVER_AWG_CONF" "${AMNEZIAWG_DIR}/params.pending"
+    startAmneziaWG
+    mv -f "${AMNEZIAWG_DIR}/params.pending" "${AMNEZIAWG_DIR}/params"
+    SETUP_NETWORK_STARTED=n
+    trap - ERR EXIT INT TERM
+    set +e
 
     newClient
     echo -e "${GREEN}If you want to add more clients, you simply need to run this script another time!${NC}"
@@ -1098,6 +1338,8 @@ function regenerateClientConfig() {
 }
 
 function newClient() {
+    set -Ee
+    trap 'setupError "$?" "$LINENO"' ERR
     CLIENT_NAME=""
     CLIENT_EXISTS=""
     IPV4_EXISTS=""
@@ -1120,8 +1362,9 @@ function newClient() {
     echo "The client name must consist of alphanumeric character(s). It may also include underscores or dashes and can't exceed 15 chars."
 
     until [[ ${CLIENT_NAME} =~ ^[a-zA-Z0-9_-]+$ && ${CLIENT_EXISTS} == '0' && ${#CLIENT_NAME} -lt 16 ]]; do
-        read -rp "Client name: " -e CLIENT_NAME
-        CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "${SERVER_AWG_CONF}")
+        read -rp "Client name: " -e CLIENT_NAME || fail "Input closed; rerun the script from an interactive terminal."
+        [[ "$CLIENT_NAME" =~ ^[a-zA-Z0-9_-]{1,15}$ ]] || { echo "Invalid client name."; continue; }
+        CLIENT_EXISTS=$(grep -c -E "^### Client ${CLIENT_NAME}\$" "${SERVER_AWG_CONF}") || true
 
         if [[ ${CLIENT_EXISTS} != 0 ]]; then
             echo ""
@@ -1137,7 +1380,7 @@ function newClient() {
         if [[ "$i" == "$SERVER_LAST_OCTET" ]]; then
             continue
         fi
-        DOT_EXISTS=$(grep -c -F "${IPV4_NET}.${i}/" "${SERVER_AWG_CONF}")
+        DOT_EXISTS=$(grep -c -F "${IPV4_NET}.${i}/" "${SERVER_AWG_CONF}") || true
         if [[ ${DOT_EXISTS} == '0' ]]; then
             DOT_IP="$i"
             break
@@ -1152,10 +1395,15 @@ function newClient() {
 
     BASE_IP="${IPV4_NET}"
     until [[ ${IPV4_EXISTS} == '0' ]]; do
-        read -rp "Client AmneziaWG IPv4: ${BASE_IP}." -e -i "${DOT_IP}" CLIENT_DOT_IP
+        read -rp "Client AmneziaWG IPv4: ${BASE_IP}." -e -i "${DOT_IP}" CLIENT_DOT_IP || fail "Input closed; rerun the script from an interactive terminal."
         CLIENT_DOT_IP="${CLIENT_DOT_IP:-${DOT_IP}}"
+        if [[ ! "$CLIENT_DOT_IP" =~ ^[0-9]{1,3}$ ]]; then echo "Enter a host number from 2 to 254."; continue; fi
+        CLIENT_DOT_IP=$((10#$CLIENT_DOT_IP))
+        if (( CLIENT_DOT_IP < 2 || CLIENT_DOT_IP > 254 || CLIENT_DOT_IP == SERVER_LAST_OCTET )); then
+            echo "Invalid client address or server address selected."; continue
+        fi
         CLIENT_AWG_IPV4="${BASE_IP}.${CLIENT_DOT_IP}"
-        IPV4_EXISTS=$(grep -c -F "$CLIENT_AWG_IPV4/32" "${SERVER_AWG_CONF}")
+        IPV4_EXISTS=$(grep -c -F "$CLIENT_AWG_IPV4/32" "${SERVER_AWG_CONF}") || true
 
         if [[ ${IPV4_EXISTS} != 0 ]]; then
             echo ""
@@ -1167,10 +1415,10 @@ function newClient() {
     if [[ ${USE_IPV6} == 'y' ]]; then
         BASE_IP=$(echo "$SERVER_AWG_IPV6" | awk -F '::' '{ print $1 }')
         until [[ ${IPV6_EXISTS} == '0' ]]; do
-            read -rp "Client AmneziaWG IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" CLIENT_DOT_IP6
+            read -rp "Client AmneziaWG IPv6: ${BASE_IP}::" -e -i "${DOT_IP}" CLIENT_DOT_IP6 || fail "Input closed; rerun the script from an interactive terminal."
             CLIENT_DOT_IP6="${CLIENT_DOT_IP6:-${DOT_IP}}"
             CLIENT_AWG_IPV6="${BASE_IP}::${CLIENT_DOT_IP6}"
-            IPV6_EXISTS=$(grep -c -F "${CLIENT_AWG_IPV6}/128" "${SERVER_AWG_CONF}")
+            IPV6_EXISTS=$(grep -c -F "${CLIENT_AWG_IPV6}/128" "${SERVER_AWG_CONF}") || true
 
             if [[ ${IPV6_EXISTS} != 0 ]]; then
                 echo ""
@@ -1209,7 +1457,11 @@ PresharedKey = ${CLIENT_PRE_SHARED_KEY}
 AllowedIPs = ${CLIENT_ADDRESS}" >> "${SERVER_AWG_CONF}"
 
     if ip link show dev "${SERVER_AWG_NIC}" >/dev/null 2>&1; then
-        awg syncconf "${SERVER_AWG_NIC}" <(awg-quick strip "${SERVER_AWG_NIC}")
+        local stripped_config
+        stripped_config=$(mktemp "${AMNEZIAWG_DIR}/.sync.XXXXXX")
+        awg-quick strip "$SERVER_AWG_NIC" > "$stripped_config"
+        awg syncconf "$SERVER_AWG_NIC" "$stripped_config"
+        rm -f "$stripped_config"
     fi
 
     # Generate QR code if qrencode is installed
@@ -1220,6 +1472,8 @@ AllowedIPs = ${CLIENT_ADDRESS}" >> "${SERVER_AWG_CONF}"
     fi
 
     echo -e "${GREEN}Your client config file is in ${CLIENT_CONFIG}${NC}"
+    trap - ERR
+    set +e
 }
 
 function listClients() {
@@ -1249,9 +1503,9 @@ function revokeClient() {
     grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3 | nl -s ') '
     until [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
         if [[ ${CLIENT_NUMBER} == '1' ]]; then
-            read -rp "Select one client [1]: " CLIENT_NUMBER
+            read -rp "Select one client [1]: " CLIENT_NUMBER || fail "Input closed; rerun the script from an interactive terminal."
         else
-            read -rp "Select one client [1-${NUMBER_OF_CLIENTS}]: " CLIENT_NUMBER
+            read -rp "Select one client [1-${NUMBER_OF_CLIENTS}]: " CLIENT_NUMBER || fail "Input closed; rerun the script from an interactive terminal."
         fi
     done
 
@@ -1292,9 +1546,9 @@ function showClientQR() {
     grep -E "^### Client" "${SERVER_AWG_CONF}" | cut -d ' ' -f 3 | nl -s ') '
     until [[ ${CLIENT_NUMBER} -ge 1 && ${CLIENT_NUMBER} -le ${NUMBER_OF_CLIENTS} ]]; do
         if [[ ${CLIENT_NUMBER} == '1' ]]; then
-            read -rp "Select one client [1]: " CLIENT_NUMBER
+            read -rp "Select one client [1]: " CLIENT_NUMBER || fail "Input closed; rerun the script from an interactive terminal."
         else
-            read -rp "Select one client [1-${NUMBER_OF_CLIENTS}]: " CLIENT_NUMBER
+            read -rp "Select one client [1-${NUMBER_OF_CLIENTS}]: " CLIENT_NUMBER || fail "Input closed; rerun the script from an interactive terminal."
         fi
     done
 
@@ -1319,7 +1573,7 @@ function uninstallAmneziaWG() {
     echo ""
     echo -e "\n${RED}WARNING: This will uninstall AmneziaWG and remove all the configuration files!${NC}"
     echo -e "${ORANGE}Please backup the /etc/amnezia/amneziawg directory if you want to keep your configuration files.\n${NC}"
-    read -rp "Do you really want to remove AmneziaWG? [y/n]: " -e REMOVE
+    read -rp "Do you really want to remove AmneziaWG? [y/n]: " -e REMOVE || fail "Input closed; rerun the script from an interactive terminal."
     REMOVE=${REMOVE:-n}
     if [[ $REMOVE == 'y' ]]; then
         checkOS
@@ -1332,7 +1586,7 @@ function uninstallAmneziaWG() {
         sysctl --system
 
         # Remove config files
-        rm -rf ${AMNEZIAWG_DIR}/*
+        rm -rf "${AMNEZIAWG_DIR:?}"/*
 
         if [[ ${USE_NFTABLES} == 'y' ]]; then NF_PACKAGE="nftables"; else NF_PACKAGE="iptables"; fi
 
@@ -1340,12 +1594,12 @@ function uninstallAmneziaWG() {
             apt-get remove -y amneziawg amneziawg-tools
             add-apt-repository -ry ppa:amnezia/ppa
             rm -f /etc/apt/sources.list.d/amneziawg.sources /etc/apt/sources.list.d/amneziawg.sources.list
-            apt-get update
+            apt-get update -o APT::Update::Error-Mode=any
         elif [[ ${OS} == 'debian' ]]; then
             apt-get remove -y amneziawg amneziawg-tools
             rm -f /etc/apt/sources.list.d/amneziawg.sources /etc/apt/sources.list.d/amneziawg.sources.list
             rm -f /etc/apt/keyrings/amneziawg-keyring.gpg
-            apt-get update
+            apt-get update -o APT::Update::Error-Mode=any
         elif [[ ${OS} == 'fedora' ]]; then
             dnf remove -y amneziawg-kmod amneziawg-tools
             dnf copr disable -y tigro/amneziawg || true
@@ -1373,7 +1627,8 @@ function uninstallAmneziaWG() {
 }
 
 function loadParams() {
-    source "${AMNEZIAWG_DIR}/params"
+    # shellcheck disable=SC1090
+    source "${1:-${AMNEZIAWG_DIR}/params}"
     SERVER_AWG_CONF="${AMNEZIAWG_DIR}/${SERVER_AWG_NIC}.conf"
     AWG_VERSION="${AWG_VERSION:-1.0}"
     SERVER_AWG_MTU="${SERVER_AWG_MTU:-1420}"
@@ -1390,6 +1645,8 @@ function loadParams() {
     SERVER_AWG_I5="${SERVER_AWG_I5:-}"
 }
 
+# Values new_i1..new_i5 are read indirectly with ${!var} below.
+# shellcheck disable=SC2034
 function editIParams() {
     echo ""
     echo "--- Change parameters: Custom Protocol Signature (I1-I5) ---"
@@ -1431,7 +1688,7 @@ function editIParams() {
 
         while true; do
             local input=""
-            read -rp "AmneziaWG I${i} [optional, Enter to keep/finish]: " -e -i "${cur_val}" input
+            read -rp "AmneziaWG I${i} [optional, Enter to keep/finish]: " -e -i "${cur_val}" input || fail "Input closed; rerun the script from an interactive terminal."
             input=$(echo "${input}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
             if [[ "${input}" == "q" || "${input}" == "quit" || "${input}" == "cancel" ]]; then
@@ -1565,7 +1822,8 @@ function backupSettings() {
         return 1
     fi
 
-    local backup_file="$(pwd)/amneziawg-backup.tar.gz"
+    local backup_file
+    backup_file="$(pwd)/amneziawg-backup.tar.gz"
 
     local backup_temp
     backup_temp=$(mktemp -d)
@@ -1642,7 +1900,8 @@ function restoreSettings() {
     echo ""
     echo "--- Restore AmneziaWG settings ---"
 
-    local backup_file="$(pwd)/amneziawg-backup.tar.gz"
+    local backup_file
+    backup_file="$(pwd)/amneziawg-backup.tar.gz"
 
     if [[ ! -f "${backup_file}" ]]; then
         echo -e "${RED}Backup archive not found: ${backup_file}${NC}"
@@ -1702,7 +1961,7 @@ function restoreSettings() {
     echo "Restoring server interface: ${restored_nic}"
     echo "Client storage mode (STORE_CLIENT): ${restored_store_client}"
     local confirm_restore=""
-    read -rp "Are you sure you want to proceed? [y/n]: " -e confirm_restore
+    read -rp "Are you sure you want to proceed? [y/n]: " -e confirm_restore || fail "Input closed; rerun the script from an interactive terminal."
     if [[ "${confirm_restore,,}" != "y" ]]; then
         echo "Restore cancelled."
         rm -rf "${restore_temp}"
@@ -1802,7 +2061,7 @@ function manageMenu() {
     echo "   8) Restore settings"
     echo "   9) Exit"
     until [[ ${MENU_OPTION} =~ ^[1-9]$ ]]; do
-        read -rp "Select an option [1-9]: " MENU_OPTION
+        read -rp "Select an option [1-9]: " MENU_OPTION || fail "Input closed; rerun the script from an interactive terminal."
     done
     case "${MENU_OPTION}" in
     1)
@@ -1835,13 +2094,54 @@ function manageMenu() {
     esac
 }
 
-# Check for root, virt, OS...
-initialCheck
+function repairAmneziaWG() {
+    local params_file="${AMNEZIAWG_DIR}/params"
+    if [[ ! -f "$params_file" ]]; then params_file="${AMNEZIAWG_DIR}/params.pending"; fi
+    [[ -f "$params_file" ]] || fail "No saved params found. Run without --repair for setup."
+    loadParams "$params_file"
+    [[ -n "$SERVER_AWG_NIC" && -s "$SERVER_AWG_CONF" ]] || fail "Saved server config is missing; restore a backup."
+    grep -Eq '^PrivateKey[[:space:]]*=[[:space:]]*[^[:space:]]+' "$SERVER_AWG_CONF" || fail "Saved server private key is empty; restore a valid configuration."
+    set -Ee
+    trap 'setupError "$?" "$LINENO"' ERR
+    trap 'rollbackSetup "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    umask 077
+    installPackages
+    enableForwarding
+    startAmneziaWG
+    if [[ "$params_file" == *.pending ]]; then mv -f "$params_file" "${AMNEZIAWG_DIR}/params"; fi
+    SETUP_NETWORK_STARTED=n
+    trap - ERR EXIT INT TERM
+    set +e
+    echo "Packages/module checked and service restarted; existing keys, clients and VPN subnet preserved."
+}
 
-# Check if AmneziaWG is already installed and load params
-if [[ -e "${AMNEZIAWG_DIR}/params" ]]; then
-    loadParams
-    manageMenu
-else
-    installAmneziaWG
+function main() {
+    case "${1:-}" in
+        ""|--repair) ;;
+        --help|-h)
+            echo "AmneziaWG installer ${SCRIPT_VERSION}"
+            echo "Usage: bash aw.sh [--repair]"
+            echo "Default: install or manage clients. --repair: repair packages/module and restart saved configuration."
+            return 0 ;;
+        *) fail "Unknown option: $1 (use --help)" ;;
+    esac
+    initialCheck
+    umask 077
+    if [[ "${1:-}" == --repair ]]; then
+        repairAmneziaWG
+    elif [[ -e "${AMNEZIAWG_DIR}/params" ]]; then
+        loadParams
+        manageMenu
+    elif [[ -f "${AMNEZIAWG_DIR}/params.pending" ]]; then
+        echo "An incomplete setup was found. Resuming it with the saved keys and subnet."
+        repairAmneziaWG
+    else
+        installAmneziaWG
+    fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
