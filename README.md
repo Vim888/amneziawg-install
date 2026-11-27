@@ -1,4 +1,4 @@
-# AmneziaWG installer
+# AmneziaWG Automatic Server Installer
 
 **This project is a bash script that aims to setup a [AmneziaWG](https://docs.amnezia.org/ru/documentation/amnezia-wg/) VPN on a Linux server, as easily as possible!**
 
@@ -6,36 +6,36 @@
 
 Supported distributions:
 
-- AlmaLinux >= 9*
-- CentOS Stream >= 9*
-- Debian >= 12
-- Fedora >= 43*
-- Red Hat Enterprise Linux (RHEL) >= 9*
-- Rocky Linux >= 9*
-- Ubuntu >= 22.04
+- Debian 13
 
-\* Uses packages from the community [tigro/amneziawg](https://copr.fedorainfracloud.org/coprs/tigro/amneziawg/) Copr repository (on Enterprise Linux 10, builds via DKMS and depends on upstream repository and kernel compatibility).
+## Changes from original repo
+
+- Full checked and verifed success runs all systemd services and route traffic on Debian 13
+- Default private IPs changed from 10.66.66.1 to 10.xx.yy.1 where xx.yy - last bits from original server IP
 
 ## Usage
+
+In first check server ip on cheburcheck.ru or similary source
 
 Before installation it is strictly recommended to upgrade your system to the latest available version and perform the reboot afterwards.
 
 Use curl or wget to download the script:
 ```bash
-curl -O https://raw.githubusercontent.com/romikb/amneziawg-install/main/amneziawg-install.sh
-```
-```bash
-wget https://raw.githubusercontent.com/romikb/amneziawg-install/main/amneziawg-install.sh
+apt update && apt upgrade -y && apt install nano fail2ban curl sudo net-tools ipcalc qrencode jq traceroute dnsutils -y
+cd ~
+mkdir ~/.aw
+cd ~/.aw
+curl https://raw.githubusercontent.com/vim888/amneziawg-install/main/amneziawg-install.sh -o aw.sh
 ```
 
 Set permissions:
 ```bash
-chmod +x amneziawg-install.sh
+chmod +x ~/.aw/aw.sh
 ```
 
 And execute:
 ```bash
-./amneziawg-install.sh
+bash ~/.aw/aw.sh
 ```
 
 Answer the questions asked by the script and it will take care of the rest.
